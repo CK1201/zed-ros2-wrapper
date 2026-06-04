@@ -527,7 +527,7 @@ def generate_launch_description():
                 choices=['zed', 'zedm', 'zed2', 'zed2i', 'zedx', 'zedxm', 'zedxnano', 'zedxhdr', 'zedxhdrmini', 'zedxhdrmax', 'virtual', 'zedxonegs', 'zedxone4k', 'zedxonehdr']),
             DeclareLaunchArgument(
                 'cpu_only',
-                default_value='false',
+                default_value='true',
                 description='Use zed-open-capture CPU-only ZED Mini publisher instead of the ZED SDK/CUDA component.',
                 choices=['true', 'false']),
             DeclareLaunchArgument(

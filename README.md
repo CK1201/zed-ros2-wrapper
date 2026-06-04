@@ -228,6 +228,11 @@ video:
 
 For repeatable recording, fixed exposure and fixed white balance are recommended.
 If the image is too dark, increase `video.exposure` first, then `video.gain`.
+In CPU-only mode, `video.whitebalance_temperature` keeps the regular ZED wrapper
+user-facing range and direction. Values are clamped to `[28,65]`, then inverted
+before writing to `zed-open-capture` with `mapped = 93 - value`; for example,
+`28` writes `6500`, `38` writes `5500`, `42` writes `5100`, and `65` writes
+`2800`.
 `video.yuv_format` should normally remain `YUYV` for ZED Mini UVC streams.
 
 #### CPU-only validation

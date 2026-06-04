@@ -41,6 +41,8 @@ constexpr char kRightFrameId[] = "zed_right_camera_optical_frame";
 constexpr char kImuFrameId[] = "zed_imu_link";
 constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 constexpr uint64_t kLikelyUnixTimeNs = 1600000000000000000ULL;
+constexpr int kMinWhiteBalanceParam = 28;
+constexpr int kMaxWhiteBalanceParam = 65;
 
 std::string trim(const std::string & input)
 {
@@ -728,9 +730,14 @@ private:
     }
 
     const bool auto_white_balance = getParam<bool>("video.auto_whitebalance", true);
+    const int white_balance_param = clampInt(
+      getParam<int>("video.whitebalance_temperature", 42),
+      kMinWhiteBalanceParam,
+      kMaxWhiteBalanceParam);
+    const int white_balance = (
+      kMinWhiteBalanceParam + kMaxWhiteBalanceParam - white_balance_param) * 100;
     video_->setAutoWhiteBalance(auto_white_balance);
     if (!auto_white_balance) {
-      const int white_balance = clampInt(getParam<int>("video.whitebalance_temperature", 42) * 100, 2800, 6500);
       video_->setWhiteBalance(white_balance);
     }
 
@@ -738,7 +745,7 @@ private:
       get_logger(),
       "Video controls applied: brightness=%d contrast=%d hue=%d saturation=%d sharpness=%d gamma=%d "
       "auto_exposure_gain=%s exposure_l=%d exposure_r=%d gain_l=%d gain_r=%d "
-      "auto_whitebalance=%s whitebalance=%d",
+      "auto_whitebalance=%s whitebalance_param=%d whitebalance=%d",
       video_->getBrightness(), video_->getContrast(), video_->getHue(),
       video_->getSaturation(), video_->getSharpness(), video_->getGamma(),
       video_->getAECAGC() ? "true" : "false",
@@ -747,6 +754,7 @@ private:
       video_->getGain(sl_oc::video::CAM_SENS_POS::LEFT),
       video_->getGain(sl_oc::video::CAM_SENS_POS::RIGHT),
       video_->getAutoWhiteBalance() ? "true" : "false",
+      white_balance_param,
       video_->getWhiteBalance());
   }
 
