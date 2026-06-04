@@ -110,6 +110,156 @@ ros2 launch zed_display_rviz2 display_zed_cam.launch.py -s
 
 For full descriptions of each parameter, follow the complete guide [here](https://www.stereolabs.com/docs/ros2/zed_node#configuration-parameters).
 
+### ZED Mini CPU-only mode without CUDA
+
+This fork also provides a CPU-only publisher for **ZED Mini** cameras on machines
+without an NVIDIA GPU, CUDA, or the ZED SDK runtime. The CPU path uses
+[`zed-open-capture`](https://github.com/stereolabs/zed-open-capture) and only
+publishes stereo images, camera calibration, and IMU data. Depth, point clouds,
+odometry, positional tracking, object detection, and mapping remain disabled in
+this mode.
+
+CPU-only mode currently supports `camera_model:=zedm` only. The regular ZED SDK
+wrapper path is unchanged when `cpu_only:=false`.
+
+#### CPU-only prerequisites
+
+- ROS 2 Jazzy on Ubuntu 24.04 was used for validation.
+- `zed-open-capture` must be installed under `/usr/local`, providing:
+  - `/usr/local/include/zed-open-capture`
+  - `/usr/local/lib/libzed_open_capture.so`
+- `hidapi` and OpenCV development packages must be installed.
+- A ZED Mini must be connected through a working USB3 port.
+
+#### CPU-only build
+
+If CUDA or the ZED SDK are not available, `zed_components` builds without the GPU
+components and still builds `zedmini_cpu_node` when `zed-open-capture` is found.
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --symlink-install --packages-up-to zed_wrapper --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/local_setup.bash
+```
+
+You can check that the CPU node does not link against the ZED SDK:
+
+```bash
+ldd install/zed_components/lib/zed_components/zedmini_cpu_node | grep sl_zed
+```
+
+The expected result is no `libsl_zed.so` entry.
+
+#### CPU-only launch
+
+```bash
+ros2 launch zed_wrapper zed_camera.launch.py \
+  camera_model:=zedm \
+  camera_name:=zed \
+  cpu_only:=true
+```
+
+By default, `video_device:=auto` scans `/sys/class/video4linux` and opens the
+first Stereolabs USB video device. A specific device can still be forced:
+
+```bash
+ros2 launch zed_wrapper zed_camera.launch.py \
+  camera_model:=zedm \
+  camera_name:=zed \
+  cpu_only:=true \
+  video_device:=/dev/video0
+```
+
+Inline launch overrides can be passed with semicolon-separated `key:=value`
+pairs:
+
+```bash
+ros2 launch zed_wrapper zed_camera.launch.py \
+  camera_model:=zedm \
+  camera_name:=zed \
+  cpu_only:=true \
+  "param_overrides:=video.exposure:=40;video.gain:=20;video.whitebalance_temperature:=35"
+```
+
+#### CPU-only topics
+
+The CPU node keeps the same namespace and node name layout as the regular wrapper
+when launched with `camera_name:=zed`:
+
+```text
+/zed/zed_node/imu/data
+/zed/zed_node/left/color/rect/image
+/zed/zed_node/left/color/rect/camera_info
+/zed/zed_node/left/color/rect/image/camera_info
+/zed/zed_node/right/color/rect/image
+/zed/zed_node/right/color/rect/camera_info
+/zed/zed_node/right/color/rect/image/camera_info
+```
+
+Images are published through `image_transport`, so installed transports also
+advertise compressed topics such as:
+
+```text
+/zed/zed_node/left/color/rect/image/compressed
+/zed/zed_node/right/color/rect/image/compressed
+```
+
+#### CPU-only camera controls
+
+The CPU node reads the existing stereo YAML files and maps these parameters to
+`zed-open-capture` camera controls:
+
+```yaml
+video:
+  yuv_format: 'YUYV'
+  brightness: 4
+  contrast: 4
+  hue: 0
+  saturation: 4
+  sharpness: 4
+  gamma: 5
+  auto_exposure_gain: false
+  exposure: 30
+  gain: 20
+  auto_whitebalance: false
+  whitebalance_temperature: 35
+```
+
+For repeatable recording, fixed exposure and fixed white balance are recommended.
+If the image is too dark, increase `video.exposure` first, then `video.gain`.
+`video.yuv_format` should normally remain `YUYV` for ZED Mini UVC streams.
+
+#### CPU-only validation
+
+```bash
+ros2 topic list | grep /zed/zed_node
+ros2 topic hz /zed/zed_node/left/color/rect/image
+ros2 topic hz /zed/zed_node/right/color/rect/image
+ros2 topic hz /zed/zed_node/imu/data
+ros2 topic echo /zed/zed_node/left/color/rect/camera_info --once
+rviz2
+```
+
+Record the stereo images and IMU:
+
+```bash
+ros2 bag record \
+  /zed/zed_node/imu/data \
+  /zed/zed_node/left/color/rect/image \
+  /zed/zed_node/left/color/rect/camera_info \
+  /zed/zed_node/right/color/rect/image \
+  /zed/zed_node/right/color/rect/camera_info
+```
+
+If RViz shows an all-green image or the node repeatedly logs empty initial
+frames, the UVC driver is not delivering real video frames. Check the USB3 cable,
+port, power, and kernel logs:
+
+```bash
+journalctl -k -f | grep -iE 'uvc|usb|zed|video|reset|error'
+```
+
 ### RViz visualization
 
 To start a pre-configured RViz environment and visualize the data of all ZED cameras, we provide in the [`zed-ros2-examples` repository](https://github.com/stereolabs/zed-ros2-examples/tree/master/zed_display_rviz2). You'll see more advanced examples and visualizations that demonstrate depth, point clouds, odometry, object detection, etc.

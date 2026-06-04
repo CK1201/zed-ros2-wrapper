@@ -41,17 +41,18 @@
             # 'zedx.yaml', 'zedxmini.yaml', 'virtual.yaml' files
 
         video:
+            yuv_format: 'YUYV' # CPU-only zed-open-capture YUV422 decode format. Use YUYV for ZED Mini UVC streams.
             saturation: 4 # [DYNAMIC]
             sharpness: 4 # [DYNAMIC]
-            gamma: 8 # [DYNAMIC]
-            auto_exposure_gain: true # [DYNAMIC]
-            exposure: 80 # [DYNAMIC]
-            gain: 80 # [DYNAMIC]
-            auto_whitebalance: true # [DYNAMIC]
-            whitebalance_temperature: 42 # [DYNAMIC] - [28,65] x100 - works only if `auto_whitebalance` is false
+            gamma: 5 # [DYNAMIC]
+            auto_exposure_gain: false # [DYNAMIC]
+            exposure: 30 # [DYNAMIC]
+            gain: 20 # [DYNAMIC]
+            auto_whitebalance: false # [DYNAMIC]
+            whitebalance_temperature: 35 # [DYNAMIC] - [28,65] x100 - works only if `auto_whitebalance` is false
             enable_24bit_output: false # [SDK >= 5.1] Enable BGR 24-bit output for lower bandwidth usage. If false, BGRA 32-bit output is used (old way before SDK v5.1)
-            publish_rgb: true # Advertise the RGB image topics that are published only if a node subscribes to them
-            publish_left_right: false # Advertise the left and right image topics that are published only if a node subscribes to them
+            publish_rgb: false # Advertise the RGB image topics that are published only if a node subscribes to them
+            publish_left_right: true # Advertise the left and right image topics that are published only if a node subscribes to them
             publish_raw: false # Advertise the raw image topics that are published only if a node subscribes to them
             publish_gray: false # Advertise the gray image topics that are published only if a node subscribes to them
             publish_stereo: false # Advertise the stereo image topic that is published only if a node subscribes to it
@@ -64,7 +65,7 @@
             sensors_pub_rate: 100. # frequency of publishing of sensors data. MAX: 400. - MIN: grab rate
             publish_imu: true # Advertise the IMU topic that is published only if a node subscribes to it
             publish_imu_raw: false # Advertise the raw IMU topic that is published only if a node subscribes to it
-            publish_cam_imu_transf: false # Advertise the CAMERA-IMU transformation topic that is published only if a node subscribes to it
+            publish_cam_imu_transf: true # Advertise the CAMERA-IMU transformation topic that is published only if a node subscribes to it
             publish_mag: false # Advertise the magnetometer topic that is published only if a node subscribes to it
             publish_baro: false # Advertise the barometer topic that is published only if a node subscribes to it
             publish_temp: false # Advertise the temperature topics that are published only if a node subscribes to them
@@ -85,7 +86,7 @@
             publish_roi_mask: false # Advertise the ROI mask image topic that is published only if a node subscribes to it
 
         depth:
-            depth_mode: 'NEURAL_LIGHT' # Matches the ZED SDK setting: 'NONE', 'NEURAL_LIGHT', 'NEURAL', 'NEURAL_PLUS' - Note: if 'NONE' all the modules that requires depth extraction are disabled by default (Pos. Tracking, Obj. Detection, Mapping, ...)
+            depth_mode: 'NONE' # Matches the ZED SDK setting: 'NONE', 'NEURAL_LIGHT', 'NEURAL', 'NEURAL_PLUS' - Note: if 'NONE' all the modules that requires depth extraction are disabled by default (Pos. Tracking, Obj. Detection, Mapping, ...)
             depth_stabilization: -1 # Negative value takes SDK default, 0 is disabled - Range: [0,100]
             openni_depth_mode: false # 'false': 32bit float [meters], 'true': 16bit unsigned int [millimeters]
             point_cloud_freq: 10.0 # [DYNAMIC] Frequency of the pointcloud publishing. This value must be <= the camera framerate. Set to 0 for no limit (= grab_frame_rate).

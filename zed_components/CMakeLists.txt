@@ -83,31 +83,6 @@ endif()
 # Dependencies
 find_package(nlohmann_json REQUIRED)
 
-# Suppress deprecation warnings from ZED SDK cmake files (uses old CMake features)
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.27")
-  cmake_policy(SET CMP0146 OLD)
-endif()
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
-  cmake_policy(SET CMP0153 OLD)
-endif()
-find_package(ZED REQUIRED)
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.27")
-  cmake_policy(SET CMP0146 NEW)
-endif()
-if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
-  cmake_policy(SET CMP0153 NEW)
-endif()
-
-execute_process(COMMAND uname -p OUTPUT_VARIABLE CMAKE_SYSTEM_NAME2 OUTPUT_STRIP_TRAILING_WHITESPACE)
-if(CMAKE_SYSTEM_NAME2 MATCHES "aarch64") # Jetson TX
-    set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
-endif()
-
-find_package(CUDAToolkit REQUIRED)
-set(CUDA_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
-set(CUDA_LIBRARIES CUDA::cudart)
-set(CUDA_LIBRARY_DIRS ${CUDAToolkit_LIBRARY_DIR})
-
 set(DEPENDENCIES
     rclcpp
     rclcpp_components
@@ -136,6 +111,37 @@ set(DEPENDENCIES
 
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
+
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d)
+
+find_path(ZED_OPEN_CAPTURE_INCLUDE_DIR
+  NAMES videocapture.hpp
+  PATHS /usr/local/include/zed-open-capture
+)
+find_library(ZED_OPEN_CAPTURE_LIBRARY
+  NAMES zed_open_capture
+  PATHS /usr/local/lib
+)
+find_path(HIDAPI_INCLUDE_DIR
+  NAMES hidapi.h
+  PATHS /usr/include/hidapi /usr/local/include/hidapi
+)
+find_library(HIDAPI_LIBRARY
+  NAMES hidapi-libusb hidapi-hidraw hidapi
+)
+
+if(NOT ZED_OPEN_CAPTURE_INCLUDE_DIR OR NOT ZED_OPEN_CAPTURE_LIBRARY)
+  message(WARNING " * zed-open-capture not found. zedmini_cpu_node will not be built.")
+else()
+  message(STATUS " * zed-open-capture include: ${ZED_OPEN_CAPTURE_INCLUDE_DIR}")
+  message(STATUS " * zed-open-capture library: ${ZED_OPEN_CAPTURE_LIBRARY}")
+endif()
+if(NOT HIDAPI_INCLUDE_DIR OR NOT HIDAPI_LIBRARY)
+  message(WARNING " * hidapi not found. zedmini_cpu_node will not be built.")
+else()
+  message(STATUS " * hidapi include: ${HIDAPI_INCLUDE_DIR}")
+  message(STATUS " * hidapi library: ${HIDAPI_LIBRARY}")
+endif()
 
 find_package(rcutils REQUIRED)
 find_package(zed_msgs)
@@ -167,6 +173,46 @@ find_package(robot_localization REQUIRED)
 
 # Debug
 find_package(backward_ros REQUIRED)
+
+option(ZED_COMPONENTS_BUILD_GPU "Build ZED SDK/CUDA component nodes" ON)
+find_package(CUDAToolkit QUIET)
+if(NOT CUDAToolkit_FOUND)
+  message(WARNING " * CUDAToolkit not found. Building zed_components without ZED SDK/CUDA components.")
+  set(ZED_COMPONENTS_BUILD_GPU OFF)
+endif()
+
+if(ZED_COMPONENTS_BUILD_GPU)
+  # Suppress deprecation warnings from ZED SDK cmake files (uses old CMake features)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.27")
+    cmake_policy(SET CMP0146 OLD)
+  endif()
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
+    cmake_policy(SET CMP0153 OLD)
+  endif()
+  find_package(ZED QUIET)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.27")
+    cmake_policy(SET CMP0146 NEW)
+  endif()
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.28")
+    cmake_policy(SET CMP0153 NEW)
+  endif()
+
+  if(NOT ZED_FOUND)
+    message(WARNING " * ZED SDK not found. Building zed_components without ZED SDK/CUDA components.")
+    set(ZED_COMPONENTS_BUILD_GPU OFF)
+  endif()
+endif()
+
+if(ZED_COMPONENTS_BUILD_GPU)
+  execute_process(COMMAND uname -p OUTPUT_VARIABLE CMAKE_SYSTEM_NAME2 OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(CMAKE_SYSTEM_NAME2 MATCHES "aarch64") # Jetson TX
+      set(CUDA_USE_STATIC_CUDA_RUNTIME OFF)
+  endif()
+
+  set(CUDA_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
+  set(CUDA_LIBRARIES CUDA::cudart)
+  set(CUDA_LIBRARY_DIRS ${CUDAToolkit_LIBRARY_DIR})
+endif()
 
 # Check ISAAC ROS Nitros availability
 find_package(isaac_ros_common QUIET)
@@ -234,13 +280,15 @@ add_custom_target(all_${PROJECT_NAME}_files SOURCES ${all_files})
 # create ament index resource which references the libraries in the binary dir
 set(node_plugins "")
 
-link_directories(${ZED_LIBRARY_DIR})
-link_directories(${CUDA_LIBRARY_DIRS})
+if(ZED_COMPONENTS_BUILD_GPU)
+  link_directories(${ZED_LIBRARY_DIR})
+  link_directories(${CUDA_LIBRARY_DIRS})
 
-set(ZED_LIBS
-  ${ZED_LIBRARIES}
-  ${CUDA_LIBRARIES}
-)
+  set(ZED_LIBS
+    ${ZED_LIBRARIES}
+    ${CUDA_LIBRARIES}
+  )
+endif()
 
 ###############################################################################
 # SOURCES
@@ -287,6 +335,35 @@ set(ZED_CAMERA_ONE_SRC
 ###############################################################################
 # Bin and Install
 
+if(ZED_OPEN_CAPTURE_INCLUDE_DIR AND ZED_OPEN_CAPTURE_LIBRARY AND HIDAPI_INCLUDE_DIR AND HIDAPI_LIBRARY)
+  add_executable(zedmini_cpu_node
+      src/zedmini_cpu/zedmini_cpu_node.cpp
+  )
+  target_include_directories(zedmini_cpu_node PRIVATE
+      ${ZED_OPEN_CAPTURE_INCLUDE_DIR}
+      ${HIDAPI_INCLUDE_DIR}
+      ${OpenCV_INCLUDE_DIRS}
+  )
+  target_compile_definitions(zedmini_cpu_node PRIVATE
+      VIDEO_MOD_AVAILABLE
+      SENSORS_MOD_AVAILABLE
+  )
+  target_link_libraries(zedmini_cpu_node
+      ${ZED_OPEN_CAPTURE_LIBRARY}
+      ${HIDAPI_LIBRARY}
+      ${OpenCV_LIBRARIES}
+  )
+  ament_target_dependencies(zedmini_cpu_node
+      rclcpp
+      sensor_msgs
+      image_transport
+  )
+  install(TARGETS zedmini_cpu_node
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+
+if(ZED_COMPONENTS_BUILD_GPU)
 # ZED Camera Component
 add_library(zed_camera_component SHARED
     ${SL_TOOLS_INC}
@@ -347,6 +424,7 @@ install(TARGETS zed_camera_component zed_camera_one_component
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
+endif()
 
 # Install header files
 install(DIRECTORY
@@ -358,9 +436,11 @@ install(DIRECTORY
 )
 
 ament_export_include_directories(include)
-ament_export_libraries(
-    zed_camera_component
-    zed_camera_one_component
-)
+if(ZED_COMPONENTS_BUILD_GPU)
+  ament_export_libraries(
+      zed_camera_component
+      zed_camera_one_component
+  )
+endif()
 ament_export_dependencies(${DEPENDENCIES})
 ament_package()

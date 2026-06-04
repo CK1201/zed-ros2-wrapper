@@ -178,6 +178,8 @@ def launch_setup(context, *args, **kwargs):
     namespace = LaunchConfiguration('namespace')
     camera_name = LaunchConfiguration('camera_name')
     camera_model = LaunchConfiguration('camera_model')
+    cpu_only = LaunchConfiguration('cpu_only')
+    video_device = LaunchConfiguration('video_device')
 
     node_name = LaunchConfiguration('node_name')
 
@@ -208,6 +210,7 @@ def launch_setup(context, *args, **kwargs):
     namespace_val = namespace.perform(context)
     camera_name_val = camera_name.perform(context)
     camera_model_val = camera_model.perform(context)
+    cpu_only_val = cpu_only.perform(context) == 'true'
     node_name_val = node_name.perform(context)
     enable_gnss_val = enable_gnss.perform(context)
     gnss_coords = parse_array_param(gnss_antenna_offset.perform(context))
@@ -386,31 +389,6 @@ def launch_setup(context, *args, **kwargs):
     )
     return_array.append(rsp_node)
 
-    # ROS 2 Component Container
-    if (container_name_val == ''):
-        container_name_val = 'zed_container'
-        distro = os.environ['ROS_DISTRO']
-        if distro == 'foxy':
-            # Foxy does not support the isolated mode
-            container_exec = 'component_container'
-            arguments_val = ['--ros-args', '--log-level', 'info']
-        else:
-            container_exec = 'component_container_isolated'
-            arguments_val = ['--use_multi_threaded_executor',
-                             '--ros-args', '--log-level', 'info']
-            # arguments_val=['--use_multi_threaded_executor','--ros-args', '--log-level', 'debug']
-
-        zed_container = ComposableNodeContainer(
-            name=container_name_val,
-            namespace=namespace_val,
-            package='rclcpp_components',
-            executable=container_exec,
-            arguments=arguments_val,
-            output=node_log_effective,
-            composable_node_descriptions=[]
-        )
-        return_array.append(zed_container)
-
     # ZED Node parameters
     node_parameters = [
         # YAML files
@@ -443,13 +421,58 @@ def launch_setup(context, *args, **kwargs):
             'sensors.publish_imu_tf': publish_imu_tf,
             'gnss_fusion.gnss_fusion_enabled': enable_gnss,
             'general.virtual_serial_numbers': serial_numbers_val,
-            'general.virtual_camera_ids': camera_ids_val
+            'general.virtual_camera_ids': camera_ids_val,
+            'video_device': video_device
         }
     )
 
     # Append inline parameter overrides (highest priority)
     if param_overrides_dict:
         node_parameters.append(param_overrides_dict)
+
+    if cpu_only_val:
+        if camera_model_val != 'zedm':
+            return_array.append(LogInfo(msg=TextSubstitution(
+                text='cpu_only:=true currently supports only camera_model:=zedm.')))
+            return return_array
+
+        info = 'Starting ZED Mini CPU-only node `' + node_name_val + '` in namespace `/' + namespace_val + '`'
+        return_array.append(LogInfo(msg=TextSubstitution(text=info)))
+        cpu_node = Node(
+            package='zed_components',
+            namespace=namespace_val,
+            executable='zedmini_cpu_node',
+            name=node_name_val,
+            output=node_log_effective,
+            parameters=node_parameters
+        )
+        return_array.append(cpu_node)
+        return return_array
+
+    # ROS 2 Component Container
+    if (container_name_val == ''):
+        container_name_val = 'zed_container'
+        distro = os.environ['ROS_DISTRO']
+        if distro == 'foxy':
+            # Foxy does not support the isolated mode
+            container_exec = 'component_container'
+            arguments_val = ['--ros-args', '--log-level', 'info']
+        else:
+            container_exec = 'component_container_isolated'
+            arguments_val = ['--use_multi_threaded_executor',
+                             '--ros-args', '--log-level', 'info']
+            # arguments_val=['--use_multi_threaded_executor','--ros-args', '--log-level', 'debug']
+
+        zed_container = ComposableNodeContainer(
+            name=container_name_val,
+            namespace=namespace_val,
+            package='rclcpp_components',
+            executable=container_exec,
+            arguments=arguments_val,
+            output=node_log_effective,
+            composable_node_descriptions=[]
+        )
+        return_array.append(zed_container)
 
     # ZED Wrapper component
     if is_stereo_model:
@@ -502,6 +525,15 @@ def generate_launch_description():
                 'camera_model',
                 description='[REQUIRED] The model of the camera. Using a wrong camera model can disable camera features.',
                 choices=['zed', 'zedm', 'zed2', 'zed2i', 'zedx', 'zedxm', 'zedxnano', 'zedxhdr', 'zedxhdrmini', 'zedxhdrmax', 'virtual', 'zedxonegs', 'zedxone4k', 'zedxonehdr']),
+            DeclareLaunchArgument(
+                'cpu_only',
+                default_value='false',
+                description='Use zed-open-capture CPU-only ZED Mini publisher instead of the ZED SDK/CUDA component.',
+                choices=['true', 'false']),
+            DeclareLaunchArgument(
+                'video_device',
+                default_value='auto',
+                description='Video device used by zed-open-capture when cpu_only is true. Use `auto` to open the first available ZED camera.'),
             DeclareLaunchArgument(
                 'container_name',
                 default_value='',
