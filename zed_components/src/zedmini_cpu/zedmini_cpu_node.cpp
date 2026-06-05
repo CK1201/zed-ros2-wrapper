@@ -1,6 +1,18 @@
-// Copyright 2026
+// Copyright 2026 Stereolabs
 //
 // CPU-only ZED Mini ROS 2 publisher backed by zed-open-capture.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <algorithm>
 #include <array>
@@ -25,6 +37,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/distortion_models.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -57,8 +70,8 @@ std::string trim(const std::string & input)
 std::string toLower(std::string value)
 {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-    return static_cast<char>(std::tolower(c));
-  });
+      return static_cast<char>(std::tolower(c));
+    });
   return value;
 }
 
@@ -143,6 +156,8 @@ struct CameraCalibration
   cv::Mat map_right_y;
   sensor_msgs::msg::CameraInfo left_info;
   sensor_msgs::msg::CameraInfo right_info;
+  std::string rectification_model;
+  double baseline_m = 0.0;
 };
 
 std::string resolutionKey(int image_width)
@@ -194,14 +209,19 @@ sensor_msgs::msg::CameraInfo makeCameraInfo(
   const cv::Size & image_size,
   const cv::Mat & rectification,
   const cv::Mat & projection,
+  const cv::Mat & distortion,
+  const std::string & distortion_model,
   const std::string & frame_id)
 {
   sensor_msgs::msg::CameraInfo info;
   info.header.frame_id = frame_id;
   info.width = static_cast<uint32_t>(image_size.width);
   info.height = static_cast<uint32_t>(image_size.height);
-  info.distortion_model = "plumb_bob";
-  info.d.assign(5, 0.0);
+  info.distortion_model = distortion_model;
+  info.d.assign(static_cast<size_t>(distortion.total()), 0.0);
+  for (int i = 0; i < distortion.rows * distortion.cols; ++i) {
+    info.d[static_cast<size_t>(i)] = distortion.at<double>(i);
+  }
 
   cv::Mat k = projection(cv::Rect(0, 0, 3, 3)).clone();
   copyMat3ToArray(k, info.k);
@@ -234,21 +254,20 @@ bool buildCalibration(
       return matrix;
     };
 
-  const auto readDistCoeffs = [&](const std::string & side) -> cv::Mat {
+  const auto readFisheyeDistCoeffs = [&](const std::string & side) -> cv::Mat {
       const std::string prefix = side + "_cam_" + res + ":";
       const double k1 = calibration.get(prefix + "k1", 0.0);
       const double k2 = calibration.get(prefix + "k2", 0.0);
-      const double p1 = calibration.get(prefix + "p1", 0.0);
-      const double p2 = calibration.get(prefix + "p2", 0.0);
       const double k3 = calibration.get(prefix + "k3", 0.0);
-      cv::Mat coeffs = (cv::Mat_<double>(5, 1) << k1, k2, p1, p2, k3);
+      const double k4 = calibration.get(prefix + "k4", 0.0);
+      cv::Mat coeffs = (cv::Mat_<double>(4, 1) << k1, k2, k3, k4);
       return coeffs;
     };
 
   cv::Mat camera_left = readCameraMatrix("left");
   cv::Mat camera_right = readCameraMatrix("right");
-  cv::Mat dist_left = readDistCoeffs("left");
-  cv::Mat dist_right = readDistCoeffs("right");
+  cv::Mat dist_left = readFisheyeDistCoeffs("left");
+  cv::Mat dist_right = readFisheyeDistCoeffs("right");
 
   if (camera_left.at<double>(0, 0) <= 0.0 || camera_right.at<double>(0, 0) <= 0.0) {
     error = "calibration file does not contain valid intrinsics for resolution " + res;
@@ -275,20 +294,24 @@ bool buildCalibration(
   cv::Mat p2;
   cv::Mat q;
   cv::Mat translation = (cv::Mat_<double>(3, 1) << tx, ty, tz);
-  cv::stereoRectify(
+  cv::fisheye::stereoRectify(
     camera_left, dist_left, camera_right, dist_right, image_size, rotation, translation,
-    r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, 0, image_size);
+    r1, r2, p1, p2, q, cv::CALIB_ZERO_DISPARITY, image_size, 0.0, 1.0);
 
-  cv::initUndistortRectifyMap(
+  cv::fisheye::initUndistortRectifyMap(
     camera_left, dist_left, r1, p1, image_size, CV_32FC1,
     output.map_left_x, output.map_left_y);
-  cv::initUndistortRectifyMap(
+  cv::fisheye::initUndistortRectifyMap(
     camera_right, dist_right, r2, p2, image_size, CV_32FC1,
     output.map_right_x, output.map_right_y);
 
-  output.left_info = makeCameraInfo(image_size, r1, p1, kLeftFrameId);
-  output.right_info = makeCameraInfo(image_size, r2, p2, kRightFrameId);
+  output.left_info = makeCameraInfo(
+    image_size, r1, p1, dist_left, sensor_msgs::distortion_models::EQUIDISTANT, kLeftFrameId);
+  output.right_info = makeCameraInfo(
+    image_size, r2, p2, dist_right, sensor_msgs::distortion_models::EQUIDISTANT, kRightFrameId);
   output.right_info.p[3] = -std::abs(output.left_info.p[0] * tx);
+  output.rectification_model = "fisheye/equidistant";
+  output.baseline_m = std::abs(tx);
 
   return true;
 }
@@ -603,7 +626,8 @@ private:
 
     sensors_ = std::make_unique<sl_oc::sensors::SensorCapture>(sl_oc::VERBOSITY::ERROR);
     if (!sensors_->initializeSensors(serial_number)) {
-      throw std::runtime_error("cannot open ZED Mini IMU for serial " + std::to_string(serial_number));
+      throw std::runtime_error("cannot open ZED Mini IMU for serial " +
+        std::to_string(serial_number));
     }
     video_->enableSensorSync(sensors_.get());
 
@@ -611,8 +635,12 @@ private:
 
     RCLCPP_INFO(
       get_logger(),
-      "ZED Mini CPU node ready: serial=%d size=%dx%d yuv_format=%s calibration=%s",
+      "ZED Mini CPU node ready: serial=%d size=%dx%d yuv_format=%s rectification=%s "
+      "fx=%.3f cx=%.3f cy=%.3f baseline=%.5fm calibration=%s",
       serial_number, image_size_.width, image_size_.height, yuv_format_.c_str(),
+      calibration_.rectification_model.c_str(),
+      calibration_.left_info.p[0], calibration_.left_info.p[2], calibration_.left_info.p[6],
+      calibration_.baseline_m,
       calibration_path.c_str());
 
     running_.store(true);
@@ -787,8 +815,10 @@ private:
     RCLCPP_INFO(get_logger(), " * Advertised on topic: %s", right_image_pub_.getTopic().c_str());
     RCLCPP_INFO(get_logger(), " * Advertised on topic: %s", left_info_pub_->get_topic_name());
     RCLCPP_INFO(get_logger(), " * Advertised on topic: %s", right_info_pub_->get_topic_name());
-    RCLCPP_INFO(get_logger(), " * Advertised on topic: %s", left_info_transport_pub_->get_topic_name());
-    RCLCPP_INFO(get_logger(), " * Advertised on topic: %s", right_info_transport_pub_->get_topic_name());
+    RCLCPP_INFO(get_logger(), " * Advertised on topic: %s",
+      left_info_transport_pub_->get_topic_name());
+    RCLCPP_INFO(get_logger(), " * Advertised on topic: %s",
+      right_info_transport_pub_->get_topic_name());
     RCLCPP_INFO(get_logger(), " * Advertised on topic: %s", imu_pub_->get_topic_name());
   }
 
@@ -873,7 +903,8 @@ private:
       if (!running_.load()) {
         break;
       }
-      const bool empty_initial_frame = frame.data != nullptr && frame.timestamp == 0 && frame.frame_id == 0;
+      const bool empty_initial_frame = frame.data != nullptr && frame.timestamp == 0 &&
+        frame.frame_id == 0;
       if (frame.data == nullptr) {
         ++null_frames;
       } else if (empty_initial_frame) {
@@ -922,7 +953,8 @@ private:
         cv::cvtColor(frame_yuv, frame_bgr, yuv_conversion_code_);
 
         cv::Mat left_raw = frame_bgr(cv::Rect(0, 0, frame_bgr.cols / 2, frame_bgr.rows));
-        cv::Mat right_raw = frame_bgr(cv::Rect(frame_bgr.cols / 2, 0, frame_bgr.cols / 2, frame_bgr.rows));
+        cv::Mat right_raw = frame_bgr(cv::Rect(frame_bgr.cols / 2, 0, frame_bgr.cols / 2,
+          frame_bgr.rows));
 
         cv::remap(
           left_raw, left_rect, calibration_.map_left_x, calibration_.map_left_y,
@@ -948,7 +980,8 @@ private:
           RCLCPP_INFO(
             get_logger(),
             "First video frame published: frame=%ux%u left=%dx%d frame_id=%lu timestamp=%lu",
-            frame.width, frame.height, left_rect.cols, left_rect.rows, frame.frame_id, frame.timestamp);
+            frame.width, frame.height, left_rect.cols, left_rect.rows, frame.frame_id,
+            frame.timestamp);
         }
         ++published_frames;
       } catch (const std::exception & e) {
