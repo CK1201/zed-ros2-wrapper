@@ -56,6 +56,7 @@ constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 constexpr uint64_t kLikelyUnixTimeNs = 1600000000000000000ULL;
 constexpr int kMinWhiteBalanceParam = 28;
 constexpr int kMaxWhiteBalanceParam = 65;
+using SteadyClock = std::chrono::steady_clock;
 
 std::string trim(const std::string & input)
 {
@@ -552,13 +553,7 @@ public:
 
   ~ZedMiniCpuNode() override
   {
-    running_.store(false);
-    if (video_thread_.joinable()) {
-      video_thread_.join();
-    }
-    if (imu_thread_.joinable()) {
-      imu_thread_.join();
-    }
+    shutdownCapture();
   }
 
 private:
@@ -584,18 +579,31 @@ private:
     }
 
     use_pub_timestamps_ = getParam<bool>("debug.use_pub_timestamps", false);
+    video_diagnostics_period_sec_ = getParam<double>("debug.video_diagnostics_period_sec", 0.0);
+    video_diagnostics_enabled_ = video_diagnostics_period_sec_ > 0.0;
     imu_pub_rate_ = getParam<double>("sensors.sensors_pub_rate", 100.0);
     yuv_conversion_code_ = parseYuvConversionCode(
       getParam<std::string>("video.yuv_format", "YUYV"), yuv_format_);
 
+    video_pub_rate_ = getParam<int>("general.grab_frame_rate", 30);
+    if (video_pub_rate_ <= 0) {
+      video_pub_rate_ = 30;
+    }
+
     sl_oc::video::VideoParams video_params;
     video_params.res = parseResolution(getParam<std::string>("general.grab_resolution", "HD720"));
-    video_params.fps = parseFps(getParam<int>("general.grab_frame_rate", 30));
+    video_params.fps = parseFps(video_pub_rate_);
     video_params.verbose = sl_oc::VERBOSITY::WARNING;
 
     const int fallback_id = getParam<int>("general.camera_id", -1);
     const std::string video_device = getParam<std::string>("video_device", "auto");
     openVideo(video_params, video_device, fallback_id);
+    if (video_->getSerialNumber() <= 0) {
+      throw std::runtime_error(
+        "Video serial is not readable after opening the ZED Mini video device. "
+        "The UVC video module is likely still in a stale state; replug the camera "
+        "or reset the USB device before launching again.");
+    }
 
     const int serial_number = resolveSerialNumber();
     if (serial_number <= 0) {
@@ -644,8 +652,45 @@ private:
       calibration_path.c_str());
 
     running_.store(true);
-    video_thread_ = std::thread(&ZedMiniCpuNode::videoLoop, this);
-    imu_thread_ = std::thread(&ZedMiniCpuNode::imuLoop, this);
+    const auto video_period = std::chrono::duration<double>(1.0 / video_pub_rate_);
+    video_timer_period_ns_ = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(video_period).count());
+    video_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(video_period),
+      [this]() {
+        publishLatestVideoFrame();
+      });
+    const auto imu_period = std::chrono::duration<double>(
+      imu_pub_rate_ > 0.0 ? 1.0 / imu_pub_rate_ : 0.001);
+    imu_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(imu_period),
+      [this]() {
+        publishLatestImu();
+      });
+  }
+
+  void shutdownCapture()
+  {
+    running_.store(false);
+    video_timer_.reset();
+    imu_timer_.reset();
+
+    for (int retries = 0; retries < 100 && video_publish_in_progress_.load(); ++retries) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    left_image_pub_ = image_transport::Publisher();
+    right_image_pub_ = image_transport::Publisher();
+    left_info_pub_.reset();
+    right_info_pub_.reset();
+    left_info_transport_pub_.reset();
+    right_info_transport_pub_.reset();
+    imu_pub_.reset();
+
+    // VideoCapture holds the SensorCapture pointer after enableSensorSync().
+    // Release video first so its grabbing thread cannot access a destroyed sensor object.
+    video_.reset();
+    sensors_.reset();
   }
 
   void openVideo(
@@ -883,151 +928,256 @@ private:
     right_info_transport_pub_->publish(right_info);
   }
 
-  void videoLoop()
+  void updateVideoTimerDiagnostics(const SteadyClock::time_point & tick_time)
   {
-    uint64_t last_timestamp = 0;
-    uint64_t last_frame_id = 0;
-    uint64_t null_frames = 0;
-    uint64_t empty_initial_frames = 0;
-    uint64_t repeated_timestamps = 0;
-    uint64_t repeated_frame_ids = 0;
-    uint64_t published_frames = 0;
-    auto last_wait_log = std::chrono::steady_clock::now();
-    auto first_wait = last_wait_log;
+    ++video_timer_ticks_;
+
+    if (last_video_timer_tick_time_.time_since_epoch().count() != 0) {
+      const auto interval_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          tick_time - last_video_timer_tick_time_).count());
+      video_timer_interval_max_ns_ = std::max(video_timer_interval_max_ns_, interval_ns);
+      if (video_timer_period_ns_ > 0 && interval_ns > video_timer_period_ns_ * 3 / 2) {
+        ++video_timer_late_ticks_;
+      }
+    }
+    last_video_timer_tick_time_ = tick_time;
+  }
+
+  void recordVideoProcessingTime(const SteadyClock::time_point & processing_start)
+  {
+    const auto processing_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        SteadyClock::now() - processing_start).count());
+    video_processing_total_ns_ += processing_ns;
+    video_processing_max_ns_ = std::max(video_processing_max_ns_, processing_ns);
+    if (video_timer_period_ns_ > 0 && processing_ns > video_timer_period_ns_) {
+      ++video_processing_overruns_;
+    }
+  }
+
+  void maybeLogVideoDiagnostics(const SteadyClock::time_point & tick_time)
+  {
+    if (!video_diagnostics_enabled_) {
+      return;
+    }
+
+    if (last_video_diagnostics_log_time_.time_since_epoch().count() == 0) {
+      last_video_diagnostics_log_time_ = tick_time;
+      return;
+    }
+
+    const auto elapsed = tick_time - last_video_diagnostics_log_time_;
+    const double elapsed_sec = std::chrono::duration<double>(elapsed).count();
+    if (elapsed_sec < video_diagnostics_period_sec_) {
+      return;
+    }
+
+    const double tick_hz = video_timer_ticks_ / elapsed_sec;
+    const double publish_hz = video_stats_published_frames_ / elapsed_sec;
+    const double avg_processing_ms = video_stats_published_frames_ > 0 ?
+      static_cast<double>(video_processing_total_ns_) /
+      static_cast<double>(video_stats_published_frames_) / 1e6 : 0.0;
+    const double max_processing_ms = static_cast<double>(video_processing_max_ns_) / 1e6;
+    const double max_tick_interval_ms = static_cast<double>(video_timer_interval_max_ns_) / 1e6;
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Video diagnostics: window=%.2fs target_hz=%.2f ticks=%llu tick_hz=%.2f "
+      "published=%llu publish_hz=%.2f busy_skips=%llu null_skips=%llu "
+      "empty_initial_skips=%llu repeated_timestamp_skips=%llu repeated_frame_id_skips=%llu "
+      "late_ticks=%llu processing_overruns=%llu avg_processing_ms=%.2f "
+      "max_processing_ms=%.2f max_tick_interval_ms=%.2f",
+      elapsed_sec, static_cast<double>(video_pub_rate_),
+      static_cast<unsigned long long>(video_timer_ticks_), tick_hz,
+      static_cast<unsigned long long>(video_stats_published_frames_), publish_hz,
+      static_cast<unsigned long long>(video_busy_skips_),
+      static_cast<unsigned long long>(video_null_frame_skips_),
+      static_cast<unsigned long long>(video_empty_initial_frame_skips_),
+      static_cast<unsigned long long>(video_repeated_timestamp_skips_),
+      static_cast<unsigned long long>(video_repeated_frame_id_skips_),
+      static_cast<unsigned long long>(video_timer_late_ticks_),
+      static_cast<unsigned long long>(video_processing_overruns_),
+      avg_processing_ms, max_processing_ms, max_tick_interval_ms);
+
+    last_video_diagnostics_log_time_ = tick_time;
+    video_timer_ticks_ = 0;
+    video_stats_published_frames_ = 0;
+    video_busy_skips_ = 0;
+    video_null_frame_skips_ = 0;
+    video_empty_initial_frame_skips_ = 0;
+    video_repeated_timestamp_skips_ = 0;
+    video_repeated_frame_id_skips_ = 0;
+    video_timer_late_ticks_ = 0;
+    video_processing_overruns_ = 0;
+    video_processing_total_ns_ = 0;
+    video_processing_max_ns_ = 0;
+    video_timer_interval_max_ns_ = 0;
+  }
+
+  void publishLatestVideoFrame()
+  {
+    SteadyClock::time_point tick_time;
+    if (video_diagnostics_enabled_) {
+      tick_time = SteadyClock::now();
+      updateVideoTimerDiagnostics(tick_time);
+    }
+
+    const auto maybe_log_diagnostics = [&]() {
+        if (video_diagnostics_enabled_) {
+          maybeLogVideoDiagnostics(tick_time);
+        }
+      };
+
+    if (!running_.load() || !video_) {
+      maybe_log_diagnostics();
+      return;
+    }
+    bool expected = false;
+    if (!video_publish_in_progress_.compare_exchange_strong(expected, true)) {
+      if (video_diagnostics_enabled_) {
+        ++video_busy_skips_;
+      }
+      maybe_log_diagnostics();
+      return;
+    }
+
+    struct VideoPublishGuard
+    {
+      std::atomic_bool & active;
+      ~VideoPublishGuard()
+      {
+        active.store(false);
+      }
+    } guard{video_publish_in_progress_};
+
     cv::Mat frame_bgr;
     cv::Mat left_rect;
     cv::Mat right_rect;
 
-    while (rclcpp::ok() && running_.load()) {
-      const auto & frame = video_->getLastFrame(100);
-      if (!running_.load()) {
-        break;
-      }
-      const bool empty_initial_frame = frame.data != nullptr && frame.timestamp == 0 &&
-        frame.frame_id == 0;
-      if (frame.data == nullptr) {
-        ++null_frames;
-      } else if (empty_initial_frame) {
-        ++empty_initial_frames;
-      } else if (frame.timestamp != 0 && frame.timestamp == last_timestamp) {
-        ++repeated_timestamps;
-      } else if (frame.timestamp == 0 && frame.frame_id != 0 && frame.frame_id == last_frame_id) {
-        ++repeated_frame_ids;
-      }
-
-      if (frame.data == nullptr || empty_initial_frame ||
-        (frame.timestamp != 0 && frame.timestamp == last_timestamp) ||
-        (frame.timestamp == 0 && frame.frame_id != 0 && frame.frame_id == last_frame_id))
-      {
-        const auto now_time = std::chrono::steady_clock::now();
-        if (published_frames == 0 &&
-          now_time - last_wait_log > std::chrono::seconds(1))
-        {
-          const auto waited_sec =
-            std::chrono::duration_cast<std::chrono::seconds>(now_time - first_wait).count();
-          if (waited_sec >= 5 && empty_initial_frames > 0 &&
-            null_frames == 0 && repeated_timestamps == 0 && repeated_frame_ids == 0)
-          {
-            RCLCPP_WARN(
-              get_logger(),
-              "Waiting for real video frames: the UVC driver is returning only empty initial frames "
-              "(frame_id=0 timestamp=0) for %lds. Check USB3 cable/port, camera power, and kernel "
-              "uvcvideo errors.",
-              static_cast<long>(waited_sec));
-          } else {
-            RCLCPP_WARN(
-              get_logger(),
-              "Waiting for video frames: null=%lu empty_initial=%lu repeated_ts=%lu repeated_frame_id=%lu last_ts=%lu last_frame_id=%lu",
-              null_frames, empty_initial_frames, repeated_timestamps, repeated_frame_ids,
-              last_timestamp, last_frame_id);
-          }
-          last_wait_log = now_time;
-        }
-        continue;
-      }
-      last_timestamp = frame.timestamp;
-      last_frame_id = frame.frame_id;
-
-      try {
-        cv::Mat frame_yuv(frame.height, frame.width, CV_8UC2, frame.data);
-        cv::cvtColor(frame_yuv, frame_bgr, yuv_conversion_code_);
-
-        cv::Mat left_raw = frame_bgr(cv::Rect(0, 0, frame_bgr.cols / 2, frame_bgr.rows));
-        cv::Mat right_raw = frame_bgr(cv::Rect(frame_bgr.cols / 2, 0, frame_bgr.cols / 2,
-          frame_bgr.rows));
-
-        cv::remap(
-          left_raw, left_rect, calibration_.map_left_x, calibration_.map_left_y,
-          cv::INTER_LINEAR);
-        cv::remap(
-          right_raw, right_rect, calibration_.map_right_x, calibration_.map_right_y,
-          cv::INTER_LINEAR);
-
-        const auto stamp = stampFromCameraTime(frame.timestamp);
-        std_msgs::msg::Header left_header;
-        left_header.stamp = stamp;
-        left_header.frame_id = kLeftFrameId;
-        std_msgs::msg::Header right_header;
-        right_header.stamp = stamp;
-        right_header.frame_id = kRightFrameId;
-
-        auto left_msg = matToImage(left_rect, left_header);
-        auto right_msg = matToImage(right_rect, right_header);
-        left_image_pub_.publish(left_msg);
-        right_image_pub_.publish(right_msg);
-        publishCameraInfos(stamp);
-        if (published_frames == 0) {
-          RCLCPP_INFO(
-            get_logger(),
-            "First video frame published: frame=%ux%u left=%dx%d frame_id=%lu timestamp=%lu",
-            frame.width, frame.height, left_rect.cols, left_rect.rows, frame.frame_id,
-            frame.timestamp);
-        }
-        ++published_frames;
-      } catch (const std::exception & e) {
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 5000,
-          "Video publishing failed: %s", e.what());
-      }
+    SteadyClock::time_point processing_start;
+    if (video_diagnostics_enabled_) {
+      processing_start = SteadyClock::now();
     }
+    const auto & frame = video_->getLastFrame(0);
+    const bool empty_initial_frame = frame.data != nullptr && frame.timestamp == 0 &&
+      frame.frame_id == 0;
+    const bool repeated_timestamp = frame.timestamp != 0 &&
+      frame.timestamp == last_video_timestamp_;
+    const bool repeated_frame_id = frame.timestamp == 0 && frame.frame_id != 0 &&
+      frame.frame_id == last_video_frame_id_;
+
+    if (frame.data == nullptr) {
+      if (video_diagnostics_enabled_) {
+        ++video_null_frame_skips_;
+      }
+      maybe_log_diagnostics();
+      return;
+    }
+    if (empty_initial_frame) {
+      if (video_diagnostics_enabled_) {
+        ++video_empty_initial_frame_skips_;
+      }
+      maybe_log_diagnostics();
+      return;
+    }
+    if (repeated_timestamp) {
+      if (video_diagnostics_enabled_) {
+        ++video_repeated_timestamp_skips_;
+      }
+      maybe_log_diagnostics();
+      return;
+    }
+    if (repeated_frame_id) {
+      if (video_diagnostics_enabled_) {
+        ++video_repeated_frame_id_skips_;
+      }
+      maybe_log_diagnostics();
+      return;
+    }
+    last_video_timestamp_ = frame.timestamp;
+    last_video_frame_id_ = frame.frame_id;
+
+    try {
+      cv::Mat frame_yuv(frame.height, frame.width, CV_8UC2, frame.data);
+      cv::cvtColor(frame_yuv, frame_bgr, yuv_conversion_code_);
+
+      cv::Mat left_raw = frame_bgr(cv::Rect(0, 0, frame_bgr.cols / 2, frame_bgr.rows));
+      cv::Mat right_raw = frame_bgr(cv::Rect(frame_bgr.cols / 2, 0, frame_bgr.cols / 2,
+        frame_bgr.rows));
+
+      cv::remap(
+        left_raw, left_rect, calibration_.map_left_x, calibration_.map_left_y,
+        cv::INTER_LINEAR);
+      cv::remap(
+        right_raw, right_rect, calibration_.map_right_x, calibration_.map_right_y,
+        cv::INTER_LINEAR);
+
+      const auto stamp = stampFromCameraTime(frame.timestamp);
+      std_msgs::msg::Header left_header;
+      left_header.stamp = stamp;
+      left_header.frame_id = kLeftFrameId;
+      std_msgs::msg::Header right_header;
+      right_header.stamp = stamp;
+      right_header.frame_id = kRightFrameId;
+
+      auto left_msg = matToImage(left_rect, left_header);
+      auto right_msg = matToImage(right_rect, right_header);
+      left_image_pub_.publish(left_msg);
+      right_image_pub_.publish(right_msg);
+      publishCameraInfos(stamp);
+      if (video_diagnostics_enabled_) {
+        recordVideoProcessingTime(processing_start);
+      }
+      if (published_video_frames_ == 0) {
+        RCLCPP_INFO(
+          get_logger(),
+          "First video frame published: frame=%ux%u left=%dx%d frame_id=%lu timestamp=%lu",
+          frame.width, frame.height, left_rect.cols, left_rect.rows, frame.frame_id,
+          frame.timestamp);
+      }
+      ++published_video_frames_;
+      if (video_diagnostics_enabled_) {
+        ++video_stats_published_frames_;
+      }
+    } catch (const std::exception & e) {
+      if (video_diagnostics_enabled_) {
+        recordVideoProcessingTime(processing_start);
+      }
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Video publishing failed: %s", e.what());
+    }
+    maybe_log_diagnostics();
   }
 
-  void imuLoop()
+  void publishLatestImu()
   {
-    uint64_t last_publish_timestamp = 0;
-    uint64_t min_period_ns = 0;
-    if (imu_pub_rate_ > 0.0) {
-      min_period_ns = static_cast<uint64_t>(1e9 / imu_pub_rate_);
+    if (!running_.load() || !sensors_) {
+      return;
     }
 
-    while (rclcpp::ok() && running_.load()) {
-      const auto imu_data = sensors_->getLastIMUData(5000);
-      if (!running_.load()) {
-        break;
-      }
-      if (imu_data.valid != sl_oc::sensors::data::Imu::NEW_VAL || imu_data.timestamp == 0) {
-        continue;
-      }
-      if (min_period_ns > 0 && last_publish_timestamp > 0 &&
-        imu_data.timestamp - last_publish_timestamp < min_period_ns)
-      {
-        continue;
-      }
-      last_publish_timestamp = imu_data.timestamp;
-
-      sensor_msgs::msg::Imu msg;
-      msg.header.stamp = stampFromCameraTime(imu_data.timestamp);
-      msg.header.frame_id = kImuFrameId;
-
-      msg.orientation_covariance[0] = -1.0;
-      msg.angular_velocity.x = static_cast<double>(imu_data.gX) * kDegToRad;
-      msg.angular_velocity.y = static_cast<double>(imu_data.gY) * kDegToRad;
-      msg.angular_velocity.z = static_cast<double>(imu_data.gZ) * kDegToRad;
-      msg.linear_acceleration.x = imu_data.aX;
-      msg.linear_acceleration.y = imu_data.aY;
-      msg.linear_acceleration.z = imu_data.aZ;
-      imu_pub_->publish(msg);
+    const auto imu_data = sensors_->getLastIMUData(0);
+    if (imu_data.valid != sl_oc::sensors::data::Imu::NEW_VAL || imu_data.timestamp == 0) {
+      return;
     }
+    if (imu_data.timestamp == last_imu_publish_timestamp_) {
+      return;
+    }
+    last_imu_publish_timestamp_ = imu_data.timestamp;
+
+    sensor_msgs::msg::Imu msg;
+    msg.header.stamp = stampFromCameraTime(imu_data.timestamp);
+    msg.header.frame_id = kImuFrameId;
+
+    msg.orientation_covariance[0] = -1.0;
+    msg.angular_velocity.x = static_cast<double>(imu_data.gX) * kDegToRad;
+    msg.angular_velocity.y = static_cast<double>(imu_data.gY) * kDegToRad;
+    msg.angular_velocity.z = static_cast<double>(imu_data.gZ) * kDegToRad;
+    msg.linear_acceleration.x = imu_data.aX;
+    msg.linear_acceleration.y = imu_data.aY;
+    msg.linear_acceleration.z = imu_data.aZ;
+    imu_pub_->publish(msg);
   }
 
   std::unique_ptr<sl_oc::video::VideoCapture> video_;
@@ -1044,10 +1194,33 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
 
   std::atomic_bool running_{false};
-  std::thread video_thread_;
-  std::thread imu_thread_;
+  rclcpp::TimerBase::SharedPtr video_timer_;
+  rclcpp::TimerBase::SharedPtr imu_timer_;
+  uint64_t last_video_timestamp_{0};
+  uint64_t last_video_frame_id_{0};
+  uint64_t published_video_frames_{0};
+  uint64_t video_timer_ticks_{0};
+  uint64_t video_stats_published_frames_{0};
+  uint64_t video_busy_skips_{0};
+  uint64_t video_null_frame_skips_{0};
+  uint64_t video_empty_initial_frame_skips_{0};
+  uint64_t video_repeated_timestamp_skips_{0};
+  uint64_t video_repeated_frame_id_skips_{0};
+  uint64_t video_timer_late_ticks_{0};
+  uint64_t video_processing_overruns_{0};
+  uint64_t video_processing_total_ns_{0};
+  uint64_t video_processing_max_ns_{0};
+  uint64_t video_timer_interval_max_ns_{0};
+  uint64_t video_timer_period_ns_{0};
+  std::atomic_bool video_publish_in_progress_{false};
+  uint64_t last_imu_publish_timestamp_{0};
+  SteadyClock::time_point last_video_timer_tick_time_;
+  SteadyClock::time_point last_video_diagnostics_log_time_;
   bool use_pub_timestamps_{false};
+  bool video_diagnostics_enabled_{false};
+  double video_diagnostics_period_sec_{0.0};
   double imu_pub_rate_{100.0};
+  int video_pub_rate_{30};
   std::string yuv_format_{"YUYV"};
   int yuv_conversion_code_{cv::COLOR_YUV2BGR_YUYV};
 };

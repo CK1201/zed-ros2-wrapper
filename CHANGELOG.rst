@@ -3,6 +3,10 @@ LATEST CHANGES
 
 v5.3
 ----------
+- Added CPU-only ZED Mini timer-based publishing for image and IMU data. The CPU-only
+  node now skips repeated camera timestamps instead of replaying stale samples, releases
+  video before sensors during shutdown, reports stale UVC video state clearly, and keeps
+  optional video diagnostics disabled by default via ``debug.video_diagnostics_period_sec``.
 - Added voxel point cloud support. When `depth.voxel_point_cloud` is enabled, the point cloud topic publishes voxel-decimated data using ``retrieveVoxelMeasure()``. New parameters: ``depth.voxel_size_mm`` (voxel cell size in millimeters), ``depth.voxel_resolution_mode`` (``FIXED``, ``STEREO_UNCERTAINTY``, ``LINEAR``), and ``depth.voxel_resolution_scale``. All voxel parameters are dynamically reconfigurable.
 - Added handling of `ERROR_CODE::CAMERA_EXCEEDS_BANDWIDTH` during camera open in both stereo and mono components. When a GMSL PHY CSI bandwidth overflow is detected, the node logs an error and stops initialization.
 - Added `XVGA` and `TXGA` as valid `grab_resolution` options for ZED X HDR camera configurations (`zedxhdr`, `zedxhdrmax`, `zedxhdrmini`, `zedxonehdr`).
